@@ -491,7 +491,14 @@ $filtered = if ($IncludeUnreachable) {
 }
 
 # Console table + persistent CSV (full unfiltered counts are still in $results below)
-$filtered | Format-Table -AutoSize
+# Render the table via Out-String + Write-Host so it is reliably captured in the
+# Start-Transcript log (Format-Table's host output is not always transcribed).
+$tableTextConsole = if ($filtered) {
+    ($filtered | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()
+} else {
+    '(no rows to display)'
+}
+Write-Host $tableTextConsole
 $filtered | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
 
 # Summary metrics
