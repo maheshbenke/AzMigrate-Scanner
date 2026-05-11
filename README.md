@@ -98,6 +98,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
     [-OsType Windows|Linux|Both]  # default: Both
     [-OutputCsv <string>]         # default: .\AzureMigrateDiscoveryScan_<timestamp>.csv
     [-TimeoutSeconds <int>]       # per-port TCP timeout, default 2
+    [-PingTimeoutMs <int>]        # ICMP + fast TCP liveness probe timeout, default 500
     [-ThrottleLimit <int>]        # parallel host scans (PS 7+), default 50
     [-IncludeUnreachable]         # also list hosts with no ping and no open ports
     [-LogFile <string>]           # transcript log path, default .\AzureMigrateDiscoveryScan_<timestamp>.log
@@ -147,6 +148,14 @@ Use more parallelism on PowerShell 7+:
 ```powershell
 pwsh -File .\Test-AzureMigrateDiscovery.ps1 -Cidr 10.0.0.0/22 -ThrottleLimit 100
 ```
+
+---
+
+## Performance notes
+
+- Each host first gets a fast ICMP probe (`-PingTimeoutMs`, default 500 ms) and, if that fails, a single short TCP "liveness" connect to the first required port. Hosts that fail both are recorded as dead and **skipped** for the full port scan, which dramatically reduces wall time on sparse subnets.
+- For live hosts, all required ports are connected to **concurrently** using `TcpClient.ConnectAsync`, so per-host wall time is bounded by `-TimeoutSeconds` rather than `N × -TimeoutSeconds`.
+- Across hosts, PowerShell 7+ uses `ForEach-Object -Parallel` with `-ThrottleLimit` (default 50). Windows PowerShell 5.1 runs hosts sequentially but still benefits from the per-host concurrent port fan-out and dead-host skip.
 
 ---
 

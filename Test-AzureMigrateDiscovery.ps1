@@ -39,6 +39,10 @@
 .PARAMETER TimeoutSeconds
     TCP connection timeout per port test. Default: 2
 
+.PARAMETER PingTimeoutMs
+    Short ICMP and TCP-liveness probe timeout in milliseconds, used to
+    quickly detect dead hosts and skip the full port scan. Default: 500
+
 .PARAMETER ThrottleLimit
     Maximum parallel host scans (PS 7+ only). Default: 50.
 
@@ -91,6 +95,8 @@ param(
 
     [int]$TimeoutSeconds = 2,
 
+    [int]$PingTimeoutMs = 500,
+
     [int]$ThrottleLimit = 50,
 
     [switch]$IncludeUnreachable,
@@ -130,6 +136,8 @@ function Write-LogMessage {
 }
 
 Write-LogMessage "Azure Migrate Discovery scan starting. OsType=$OsType TimeoutSeconds=$TimeoutSeconds ThrottleLimit=$ThrottleLimit"
+$script:ScanStartTime = Get-Date
+Write-LogMessage ("Start time: {0:yyyy-MM-dd HH:mm:ss zzz}" -f $script:ScanStartTime)
 Write-LogMessage "Log file : $LogFile"
 Write-LogMessage "Output CSV: $OutputCsv"
 Write-LogMessage "Output report: $OutputReport"
@@ -277,28 +285,17 @@ $portsToTest = switch ($OsType) {
 # ForEach-Object -Parallel cannot accept script blocks via $using:.
 # ===========================================================================
 $scanScript = {
-    param($target, $ports, $timeout)
+    param($target, $ports, $timeoutSec, $pingTimeoutMs)
 
-    # Async TCP connect with a hard timeout so closed/filtered ports don't stall the scan.
-    function Test-TcpPort([string]$T, [int]$P, [int]$To) {
-        $client = New-Object System.Net.Sockets.TcpClient
-        try {
-            $iar = $client.BeginConnect($T, $P, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($To), $false)) {
-                try { $client.EndConnect($iar); return $true } catch { return $false }
-            }
-            return $false
-        } catch { return $false }
-        finally { $client.Close() }
-    }
+    $timeoutMs = [int]($timeoutSec * 1000)
 
-    # Resolve host <-> IP. If input is an IP, do reverse DNS; otherwise forward DNS.
+    # ---- DNS / IP resolution ----
     $hostName = ''
     $ipAddr   = $null
     try {
         if ($target -match '^\d{1,3}(\.\d{1,3}){3}$') {
             $ipAddr = $target
-            try { $hostName = [System.Net.Dns]::GetHostEntry($target).HostName } catch { }   # reverse DNS may be empty
+            try { $hostName = [System.Net.Dns]::GetHostEntry($target).HostName } catch { }
         } else {
             $hostName = $target
             $ipAddr = ([System.Net.Dns]::GetHostAddresses($target) |
@@ -307,25 +304,70 @@ $scanScript = {
         }
     } catch { }
 
-    # Quick reachability hint (some hosts block ICMP but still have ports open).
+    # ---- Fast ICMP probe (short timeout so dead hosts don't dominate the scan) ----
     $ping = $false
-    try { $ping = Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue } catch { }
+    $pinger = New-Object System.Net.NetworkInformation.Ping
+    try {
+        $reply = $pinger.Send($target, $pingTimeoutMs)
+        $ping  = ($reply -and $reply.Status -eq 'Success')
+    } catch { } finally { $pinger.Dispose() }
 
-    # Build the result row; columns are added dynamically per port tested.
     $row = [ordered]@{
         IPAddress = $ipAddr
         HostName  = $hostName
         Ping      = if ($ping) { 'OK' } else { 'FAIL' }
     }
 
-    $openCount = 0
-    foreach ($p in $ports) {
-        $open = Test-TcpPort -T $target -P $p.Port -To $timeout
-        $row["$($p.Name)($($p.Port))"] = if ($open) { 'OPEN' } else { '-' }
-        if ($open) { $openCount++ }
+    # ---- TCP liveness probe: many hosts block ICMP. Try a single short TCP
+    # connect to the first required port. If both ICMP and this fail, treat
+    # the host as dead and skip the full port scan to save N * timeout. ----
+    $alive = $ping
+    if (-not $alive -and $ports.Count -gt 0) {
+        $probePort   = $ports[0].Port
+        $probeClient = New-Object System.Net.Sockets.TcpClient
+        try {
+            $probeTask = $probeClient.ConnectAsync($target, $probePort)
+            if ($probeTask.Wait($pingTimeoutMs)) {
+                $alive = (-not $probeTask.IsFaulted) -and $probeClient.Connected
+            }
+        } catch { } finally { try { $probeClient.Close() } catch { } }
     }
 
-    # A host is considered "discovery ready" if at least one required port is open.
+    if (-not $alive) {
+        foreach ($p in $ports) { $row["$($p.Name)($($p.Port))"] = '-' }
+        $row['OpenPorts']      = 0
+        $row['DiscoveryReady'] = 'NO'
+        return [pscustomobject]$row
+    }
+
+    # ---- Fan-out: connect to all ports concurrently with one shared deadline.
+    # Per-host wall time is bounded by $timeoutSec instead of N * $timeoutSec. ----
+    $clients = New-Object 'System.Collections.Generic.Dictionary[string,System.Net.Sockets.TcpClient]'
+    $tasks   = New-Object 'System.Collections.Generic.Dictionary[string,System.Threading.Tasks.Task]'
+    foreach ($p in $ports) {
+        $key = "$($p.Name)($($p.Port))"
+        $c   = New-Object System.Net.Sockets.TcpClient
+        $clients[$key] = $c
+        try { $tasks[$key] = $c.ConnectAsync($target, $p.Port) } catch { $tasks[$key] = $null }
+    }
+
+    $taskArray = @($tasks.Values | Where-Object { $_ })
+    if ($taskArray.Count -gt 0) {
+        try { [System.Threading.Tasks.Task]::WaitAll($taskArray, $timeoutMs) | Out-Null } catch { }
+    }
+
+    $openCount = 0
+    foreach ($p in $ports) {
+        $key  = "$($p.Name)($($p.Port))"
+        $t    = $tasks[$key]
+        $c    = $clients[$key]
+        $open = $false
+        if ($t -and $t.IsCompleted -and -not $t.IsFaulted -and $c.Connected) { $open = $true }
+        $row[$key] = if ($open) { 'OPEN' } else { '-' }
+        if ($open) { $openCount++ }
+        try { $c.Close() } catch { }
+    }
+
     $row['OpenPorts']      = $openCount
     $row['DiscoveryReady'] = if ($openCount -gt 0) { 'YES' } else { 'NO' }
     [pscustomobject]$row
@@ -344,21 +386,11 @@ if ($useParallel) {
     $results = $targets | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         # NOTE: logic below mirrors $scanScript above. Inlined because
         # -Parallel does not allow $using: to pass a [scriptblock].
-        $target  = $_
-        $ports   = $using:portsToTest
-        $timeout = $using:TimeoutSeconds
-
-        function Test-TcpPort([string]$T, [int]$P, [int]$To) {
-            $client = New-Object System.Net.Sockets.TcpClient
-            try {
-                $iar = $client.BeginConnect($T, $P, $null, $null)
-                if ($iar.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($To), $false)) {
-                    try { $client.EndConnect($iar); return $true } catch { return $false }
-                }
-                return $false
-            } catch { return $false }
-            finally { $client.Close() }
-        }
+        $target        = $_
+        $ports         = $using:portsToTest
+        $timeoutSec    = $using:TimeoutSeconds
+        $pingTimeoutMs = $using:PingTimeoutMs
+        $timeoutMs     = [int]($timeoutSec * 1000)
 
         $hostName = ''
         $ipAddr   = $null
@@ -375,7 +407,11 @@ if ($useParallel) {
         } catch { }
 
         $ping = $false
-        try { $ping = Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue } catch { }
+        $pinger = New-Object System.Net.NetworkInformation.Ping
+        try {
+            $reply = $pinger.Send($target, $pingTimeoutMs)
+            $ping  = ($reply -and $reply.Status -eq 'Success')
+        } catch { } finally { $pinger.Dispose() }
 
         $row = [ordered]@{
             IPAddress = $ipAddr
@@ -383,11 +419,49 @@ if ($useParallel) {
             Ping      = if ($ping) { 'OK' } else { 'FAIL' }
         }
 
+        $alive = $ping
+        if (-not $alive -and $ports.Count -gt 0) {
+            $probePort   = $ports[0].Port
+            $probeClient = New-Object System.Net.Sockets.TcpClient
+            try {
+                $probeTask = $probeClient.ConnectAsync($target, $probePort)
+                if ($probeTask.Wait($pingTimeoutMs)) {
+                    $alive = (-not $probeTask.IsFaulted) -and $probeClient.Connected
+                }
+            } catch { } finally { try { $probeClient.Close() } catch { } }
+        }
+
+        if (-not $alive) {
+            foreach ($p in $ports) { $row["$($p.Name)($($p.Port))"] = '-' }
+            $row['OpenPorts']      = 0
+            $row['DiscoveryReady'] = 'NO'
+            return [pscustomobject]$row
+        }
+
+        $clients = New-Object 'System.Collections.Generic.Dictionary[string,System.Net.Sockets.TcpClient]'
+        $tasks   = New-Object 'System.Collections.Generic.Dictionary[string,System.Threading.Tasks.Task]'
+        foreach ($p in $ports) {
+            $key = "$($p.Name)($($p.Port))"
+            $c   = New-Object System.Net.Sockets.TcpClient
+            $clients[$key] = $c
+            try { $tasks[$key] = $c.ConnectAsync($target, $p.Port) } catch { $tasks[$key] = $null }
+        }
+
+        $taskArray = @($tasks.Values | Where-Object { $_ })
+        if ($taskArray.Count -gt 0) {
+            try { [System.Threading.Tasks.Task]::WaitAll($taskArray, $timeoutMs) | Out-Null } catch { }
+        }
+
         $openCount = 0
         foreach ($p in $ports) {
-            $open = Test-TcpPort -T $target -P $p.Port -To $timeout
-            $row["$($p.Name)($($p.Port))"] = if ($open) { 'OPEN' } else { '-' }
+            $key  = "$($p.Name)($($p.Port))"
+            $t    = $tasks[$key]
+            $c    = $clients[$key]
+            $open = $false
+            if ($t -and $t.IsCompleted -and -not $t.IsFaulted -and $c.Connected) { $open = $true }
+            $row[$key] = if ($open) { 'OPEN' } else { '-' }
             if ($open) { $openCount++ }
+            try { $c.Close() } catch { }
         }
 
         $row['OpenPorts']      = $openCount
@@ -400,7 +474,7 @@ if ($useParallel) {
     foreach ($t in $targets) {
         $i++
         Write-Progress -Activity 'Azure Migrate Discovery Scan' -Status "Testing $t ($i / $total)" -PercentComplete (($i / $total) * 100)
-        $results += & $scanScript $t $portsToTest $TimeoutSeconds
+        $results += & $scanScript $t $portsToTest $TimeoutSeconds $PingTimeoutMs
     }
     Write-Progress -Activity 'Azure Migrate Discovery Scan' -Completed
 }
@@ -422,9 +496,14 @@ $filtered | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
 
 # Summary metrics
 Write-Host ""
+$script:ScanEndTime = Get-Date
+$scanDuration = $script:ScanEndTime - $script:ScanStartTime
 $ready = ($results | Where-Object DiscoveryReady -eq 'YES').Count
 $alive = ($results | Where-Object Ping           -eq 'OK').Count
 Write-LogMessage "Scan complete. Results exported to: $OutputCsv"
+Write-LogMessage ("Start time            : {0:yyyy-MM-dd HH:mm:ss zzz}" -f $script:ScanStartTime)
+Write-LogMessage ("End time              : {0:yyyy-MM-dd HH:mm:ss zzz}" -f $script:ScanEndTime)
+Write-LogMessage ("Duration              : {0:hh\:mm\:ss\.fff}" -f $scanDuration)
 Write-LogMessage "Total scanned         : $total"
 Write-LogMessage "Responded to ping     : $alive"
 Write-LogMessage "Discovery-ready hosts : $ready"
@@ -460,6 +539,9 @@ try {
     $reportLines.Add('')
     $reportLines.Add('Summary')
     $reportLines.Add('-------------------------------------------------------------------------')
+    $reportLines.Add(("  Start time            : {0:yyyy-MM-dd HH:mm:ss zzz}" -f $script:ScanStartTime))
+    $reportLines.Add(("  End time              : {0:yyyy-MM-dd HH:mm:ss zzz}" -f $script:ScanEndTime))
+    $reportLines.Add(("  Duration              : {0:hh\:mm\:ss\.fff}" -f $scanDuration))
     $reportLines.Add(("  Total scanned         : {0}" -f $total))
     $reportLines.Add(("  Responded to ping     : {0}" -f $alive))
     $reportLines.Add(("  Discovery-ready hosts : {0}" -f $ready))
