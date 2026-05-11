@@ -45,6 +45,15 @@
 .PARAMETER IncludeUnreachable
     Include hosts that did not respond to ping AND had no open ports.
 
+.PARAMETER LogFile
+    Path to a transcript log file capturing all console output and scan
+    milestones. Default: .\AzureMigrateDiscoveryScan_<timestamp>.log
+
+.PARAMETER OutputReport
+    Path to a human-readable text report summarizing the scan (parameters,
+    target count, summary metrics, and a formatted results table).
+    Default: .\AzureMigrateDiscoveryScan_<timestamp>.txt
+
 .EXAMPLE
     .\Test-AzureMigrateDiscovery.ps1 -Cidr 10.0.0.0/24 -OsType Windows
 
@@ -84,8 +93,46 @@ param(
 
     [int]$ThrottleLimit = 50,
 
-    [switch]$IncludeUnreachable
+    [switch]$IncludeUnreachable,
+
+    [string]$LogFile = ".\AzureMigrateDiscoveryScan_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+
+    [string]$OutputReport = ".\AzureMigrateDiscoveryScan_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 )
+
+# ===========================================================================
+# Start transcript log. Captures all Write-Host / pipeline output plus the
+# timestamped milestones written via Write-LogMessage below.
+# ===========================================================================
+try {
+    $logDir = Split-Path -Parent $LogFile
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    Start-Transcript -Path $LogFile -Append -Force | Out-Null
+    $script:TranscriptStarted = $true
+} catch {
+    Write-Warning "Could not start transcript log '$LogFile': $($_.Exception.Message)"
+    $script:TranscriptStarted = $false
+}
+
+function Write-LogMessage {
+    param(
+        [Parameter(Mandatory)] [string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')] [string]$Level = 'INFO'
+    )
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    switch ($Level) {
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+        default { Write-Host $line -ForegroundColor Gray }
+    }
+}
+
+Write-LogMessage "Azure Migrate Discovery scan starting. OsType=$OsType TimeoutSeconds=$TimeoutSeconds ThrottleLimit=$ThrottleLimit"
+Write-LogMessage "Log file : $LogFile"
+Write-LogMessage "Output CSV: $OutputCsv"
+Write-LogMessage "Output report: $OutputReport"
 
 # ===========================================================================
 # Helper functions
@@ -193,8 +240,12 @@ switch ($PSCmdlet.ParameterSetName) {
 # Deduplicate (e.g. overlapping CIDRs) and short-circuit if nothing to do
 $targets = $targets | Select-Object -Unique
 $total   = $targets.Count
-if ($total -eq 0) { throw "No valid targets to scan." }
-Write-Host "Resolved $total target(s) to scan." -ForegroundColor Cyan
+if ($total -eq 0) {
+    Write-LogMessage "No valid targets to scan." -Level ERROR
+    if ($script:TranscriptStarted) { try { Stop-Transcript | Out-Null } catch { } }
+    throw "No valid targets to scan."
+}
+Write-LogMessage "Resolved $total target(s) to scan."
 
 # ===========================================================================
 # Ports required by the Azure Migrate appliance for agentless discovery.
@@ -371,9 +422,67 @@ $filtered | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
 
 # Summary metrics
 Write-Host ""
-Write-Host "Scan complete. Results exported to: $OutputCsv" -ForegroundColor Green
 $ready = ($results | Where-Object DiscoveryReady -eq 'YES').Count
 $alive = ($results | Where-Object Ping           -eq 'OK').Count
-Write-Host "Total scanned          : $total"
-Write-Host "Responded to ping      : $alive"  -ForegroundColor Cyan
-Write-Host "Discovery-ready hosts  : $ready"  -ForegroundColor Green
+Write-LogMessage "Scan complete. Results exported to: $OutputCsv"
+Write-LogMessage "Total scanned         : $total"
+Write-LogMessage "Responded to ping     : $alive"
+Write-LogMessage "Discovery-ready hosts : $ready"
+Write-LogMessage "Log file              : $LogFile"
+Write-LogMessage "Report file           : $OutputReport"
+
+# ===========================================================================
+# Human-readable text report
+# ===========================================================================
+try {
+    $reportDir = Split-Path -Parent $OutputReport
+    if ($reportDir -and -not (Test-Path $reportDir)) {
+        New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+    }
+
+    $reportLines = New-Object System.Collections.Generic.List[string]
+    $reportLines.Add('=========================================================================')
+    $reportLines.Add(' Azure Migrate Discovery Readiness Scan Report')
+    $reportLines.Add('=========================================================================')
+    $reportLines.Add("Generated         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')")
+    $reportLines.Add("Run by            : $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME")
+    $reportLines.Add("PowerShell version: $($PSVersionTable.PSVersion)")
+    $reportLines.Add('')
+    $reportLines.Add('Parameters')
+    $reportLines.Add('-------------------------------------------------------------------------')
+    $reportLines.Add("  ParameterSet      : $($PSCmdlet.ParameterSetName)")
+    $reportLines.Add("  OsType            : $OsType")
+    $reportLines.Add("  TimeoutSeconds    : $TimeoutSeconds")
+    $reportLines.Add("  ThrottleLimit     : $ThrottleLimit")
+    $reportLines.Add("  IncludeUnreachable: $IncludeUnreachable")
+    $reportLines.Add("  OutputCsv         : $OutputCsv")
+    $reportLines.Add("  LogFile           : $LogFile")
+    $reportLines.Add('')
+    $reportLines.Add('Summary')
+    $reportLines.Add('-------------------------------------------------------------------------')
+    $reportLines.Add(("  Total scanned         : {0}" -f $total))
+    $reportLines.Add(("  Responded to ping     : {0}" -f $alive))
+    $reportLines.Add(("  Discovery-ready hosts : {0}" -f $ready))
+    $reportLines.Add(("  Rows in report        : {0}" -f ($filtered | Measure-Object).Count))
+    $reportLines.Add('')
+    $reportLines.Add('Results')
+    $reportLines.Add('-------------------------------------------------------------------------')
+    $tableText = if ($filtered) {
+        ($filtered | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()
+    } else {
+        '(no rows to display)'
+    }
+    $reportLines.Add($tableText)
+    $reportLines.Add('')
+    $reportLines.Add('=========================================================================')
+    $reportLines.Add(' End of report')
+    $reportLines.Add('=========================================================================')
+
+    Set-Content -Path $OutputReport -Value $reportLines -Encoding UTF8
+} catch {
+    Write-LogMessage "Failed to write report '$OutputReport': $($_.Exception.Message)" -Level WARN
+}
+
+if ($script:TranscriptStarted) {
+    try { Stop-Transcript | Out-Null } catch { }
+}

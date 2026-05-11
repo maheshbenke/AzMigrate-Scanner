@@ -100,6 +100,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
     [-TimeoutSeconds <int>]       # per-port TCP timeout, default 2
     [-ThrottleLimit <int>]        # parallel host scans (PS 7+), default 50
     [-IncludeUnreachable]         # also list hosts with no ping and no open ports
+    [-LogFile <string>]           # transcript log path, default .\AzureMigrateDiscoveryScan_<timestamp>.log
+    [-OutputReport <string>]      # text report path,    default .\AzureMigrateDiscoveryScan_<timestamp>.txt
 ```
 
 ### Examples
@@ -152,6 +154,8 @@ pwsh -File .\Test-AzureMigrateDiscovery.ps1 -Cidr 10.0.0.0/22 -ThrottleLimit 100
 
 - A formatted table is written to the console.
 - A CSV is written to `-OutputCsv` (default: `.\AzureMigrateDiscoveryScan_<timestamp>.csv` in the current directory).
+- A human-readable text report is written to `-OutputReport` (default: `.\AzureMigrateDiscoveryScan_<timestamp>.txt`) containing run metadata, parameters, summary metrics, and a formatted results table.
+- A transcript log is written to `-LogFile` (default: `.\AzureMigrateDiscoveryScan_<timestamp>.log`) capturing all console output plus timestamped scan milestones (`[yyyy-MM-dd HH:mm:ss] [INFO|WARN|ERROR] ...`).
 - The CSV includes per-host ping status, DNS name, and the open/closed state of each tested port — suitable for sharing with the team responsible for firewall and OS configuration before onboarding to Azure Migrate.
 
 ---
