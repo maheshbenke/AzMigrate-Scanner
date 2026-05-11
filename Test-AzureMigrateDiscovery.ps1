@@ -375,106 +375,150 @@ $scanScript = {
 
 # ===========================================================================
 # Execute scan
-#   PS 7+  : ForEach-Object -Parallel (fast - default 50 concurrent hosts)
+#   PS 7+  : ForEach-Object -Parallel in batches (so progress is visible and
+#            the CSV grows incrementally instead of waiting for the full run)
 #   PS 5.1 : sequential loop with progress bar
 # ===========================================================================
-$results = @()
-$useParallel = $PSVersionTable.PSVersion.Major -ge 7
+$results       = New-Object System.Collections.Generic.List[object]
+$useParallel   = $PSVersionTable.PSVersion.Major -ge 7
+# Keep batches small enough that the user sees progress on large scans (/22, /16)
+# but large enough to amortize the per-batch ForEach-Object -Parallel overhead.
+$batchSize     = [Math]::Min([Math]::Max([int]$ThrottleLimit * 2, 100), 256)
+$csvHeaderDone = $false
+
+function Write-ResultsBatch {
+    param([System.Collections.IEnumerable]$Batch)
+    if (-not $Batch) { return }
+    if (-not $script:csvHeaderDone) {
+        $Batch | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+        $script:csvHeaderDone = $true
+    } else {
+        $Batch | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8 -Append
+    }
+}
 
 if ($useParallel) {
-    Write-Host "Scanning in parallel (ThrottleLimit=$ThrottleLimit)..." -ForegroundColor Cyan
-    $results = $targets | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-        # NOTE: logic below mirrors $scanScript above. Inlined because
-        # -Parallel does not allow $using: to pass a [scriptblock].
-        $target        = $_
-        $ports         = $using:portsToTest
-        $timeoutSec    = $using:TimeoutSeconds
-        $pingTimeoutMs = $using:PingTimeoutMs
-        $timeoutMs     = [int]($timeoutSec * 1000)
+    Write-LogMessage "Scanning in parallel (ThrottleLimit=$ThrottleLimit, BatchSize=$batchSize)..."
+    $processed = 0
+    for ($offset = 0; $offset -lt $total; $offset += $batchSize) {
+        $end   = [Math]::Min($offset + $batchSize, $total) - 1
+        $slice = $targets[$offset..$end]
+        Write-LogMessage ("Testing hosts {0}-{1} of {2}: {3} .. {4}" -f ($offset + 1), ($end + 1), $total, $slice[0], $slice[-1])
 
-        $hostName = ''
-        $ipAddr   = $null
-        try {
-            if ($target -match '^\d{1,3}(\.\d{1,3}){3}$') {
-                $ipAddr = $target
-                try { $hostName = [System.Net.Dns]::GetHostEntry($target).HostName } catch { }
-            } else {
-                $hostName = $target
-                $ipAddr = ([System.Net.Dns]::GetHostAddresses($target) |
-                    Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
-                    Select-Object -First 1).IPAddressToString
-            }
-        } catch { }
+        $batchResults = $slice | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+            # NOTE: logic below mirrors $scanScript above. Inlined because
+            # -Parallel does not allow $using: to pass a [scriptblock].
+            $target        = $_
+            $ports         = $using:portsToTest
+            $timeoutSec    = $using:TimeoutSeconds
+            $pingTimeoutMs = $using:PingTimeoutMs
+            $timeoutMs     = [int]($timeoutSec * 1000)
 
-        $ping = $false
-        $pinger = New-Object System.Net.NetworkInformation.Ping
-        try {
-            $reply = $pinger.Send($target, $pingTimeoutMs)
-            $ping  = ($reply -and $reply.Status -eq 'Success')
-        } catch { } finally { $pinger.Dispose() }
-
-        $row = [ordered]@{
-            IPAddress = $ipAddr
-            HostName  = $hostName
-            Ping      = if ($ping) { 'OK' } else { 'FAIL' }
-        }
-
-        $alive = $ping
-        if (-not $alive -and $ports.Count -gt 0) {
-            $probePort   = $ports[0].Port
-            $probeClient = New-Object System.Net.Sockets.TcpClient
+            $hostName = ''
+            $ipAddr   = $null
             try {
-                $probeTask = $probeClient.ConnectAsync($target, $probePort)
-                if ($probeTask.Wait($pingTimeoutMs)) {
-                    $alive = (-not $probeTask.IsFaulted) -and $probeClient.Connected
+                if ($target -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                    $ipAddr = $target
+                    try { $hostName = [System.Net.Dns]::GetHostEntry($target).HostName } catch { }
+                } else {
+                    $hostName = $target
+                    $ipAddr = ([System.Net.Dns]::GetHostAddresses($target) |
+                        Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                        Select-Object -First 1).IPAddressToString
                 }
-            } catch { } finally { try { $probeClient.Close() } catch { } }
+            } catch { }
+
+            $ping = $false
+            $pinger = New-Object System.Net.NetworkInformation.Ping
+            try {
+                $reply = $pinger.Send($target, $pingTimeoutMs)
+                $ping  = ($reply -and $reply.Status -eq 'Success')
+            } catch { } finally { $pinger.Dispose() }
+
+            $row = [ordered]@{
+                IPAddress = $ipAddr
+                HostName  = $hostName
+                Ping      = if ($ping) { 'OK' } else { 'FAIL' }
+            }
+
+            $alive = $ping
+            if (-not $alive -and $ports.Count -gt 0) {
+                $probePort   = $ports[0].Port
+                $probeClient = New-Object System.Net.Sockets.TcpClient
+                try {
+                    $probeTask = $probeClient.ConnectAsync($target, $probePort)
+                    if ($probeTask.Wait($pingTimeoutMs)) {
+                        $alive = (-not $probeTask.IsFaulted) -and $probeClient.Connected
+                    }
+                } catch { } finally { try { $probeClient.Close() } catch { } }
+            }
+
+            if (-not $alive) {
+                foreach ($p in $ports) { $row["$($p.Name)($($p.Port))"] = '-' }
+                $row['OpenPorts']      = 0
+                $row['DiscoveryReady'] = 'NO'
+                return [pscustomobject]$row
+            }
+
+            $clients = New-Object 'System.Collections.Generic.Dictionary[string,System.Net.Sockets.TcpClient]'
+            $tasks   = New-Object 'System.Collections.Generic.Dictionary[string,System.Threading.Tasks.Task]'
+            foreach ($p in $ports) {
+                $key = "$($p.Name)($($p.Port))"
+                $c   = New-Object System.Net.Sockets.TcpClient
+                $clients[$key] = $c
+                try { $tasks[$key] = $c.ConnectAsync($target, $p.Port) } catch { $tasks[$key] = $null }
+            }
+
+            $taskArray = @($tasks.Values | Where-Object { $_ })
+            if ($taskArray.Count -gt 0) {
+                try { [System.Threading.Tasks.Task]::WaitAll($taskArray, $timeoutMs) | Out-Null } catch { }
+            }
+
+            $openCount = 0
+            foreach ($p in $ports) {
+                $key  = "$($p.Name)($($p.Port))"
+                $t    = $tasks[$key]
+                $c    = $clients[$key]
+                $open = $false
+                if ($t -and $t.IsCompleted -and -not $t.IsFaulted -and $c.Connected) { $open = $true }
+                $row[$key] = if ($open) { 'OPEN' } else { '-' }
+                if ($open) { $openCount++ }
+                try { $c.Close() } catch { }
+            }
+
+            $row['OpenPorts']      = $openCount
+            $row['DiscoveryReady'] = if ($openCount -gt 0) { 'YES' } else { 'NO' }
+            [pscustomobject]$row
         }
 
-        if (-not $alive) {
-            foreach ($p in $ports) { $row["$($p.Name)($($p.Port))"] = '-' }
-            $row['OpenPorts']      = 0
-            $row['DiscoveryReady'] = 'NO'
-            return [pscustomobject]$row
-        }
-
-        $clients = New-Object 'System.Collections.Generic.Dictionary[string,System.Net.Sockets.TcpClient]'
-        $tasks   = New-Object 'System.Collections.Generic.Dictionary[string,System.Threading.Tasks.Task]'
-        foreach ($p in $ports) {
-            $key = "$($p.Name)($($p.Port))"
-            $c   = New-Object System.Net.Sockets.TcpClient
-            $clients[$key] = $c
-            try { $tasks[$key] = $c.ConnectAsync($target, $p.Port) } catch { $tasks[$key] = $null }
-        }
-
-        $taskArray = @($tasks.Values | Where-Object { $_ })
-        if ($taskArray.Count -gt 0) {
-            try { [System.Threading.Tasks.Task]::WaitAll($taskArray, $timeoutMs) | Out-Null } catch { }
-        }
-
-        $openCount = 0
-        foreach ($p in $ports) {
-            $key  = "$($p.Name)($($p.Port))"
-            $t    = $tasks[$key]
-            $c    = $clients[$key]
-            $open = $false
-            if ($t -and $t.IsCompleted -and -not $t.IsFaulted -and $c.Connected) { $open = $true }
-            $row[$key] = if ($open) { 'OPEN' } else { '-' }
-            if ($open) { $openCount++ }
-            try { $c.Close() } catch { }
-        }
-
-        $row['OpenPorts']      = $openCount
-        $row['DiscoveryReady'] = if ($openCount -gt 0) { 'YES' } else { 'NO' }
-        [pscustomobject]$row
+        foreach ($r in $batchResults) { $results.Add($r) }
+        $processed   = $end + 1
+        $batchAlive  = ($batchResults | Where-Object { $_.Ping -eq 'OK' -or $_.OpenPorts -gt 0 }).Count
+        $batchToCsv  = if ($IncludeUnreachable) { $batchResults } else { $batchResults | Where-Object { $_.Ping -eq 'OK' -or $_.OpenPorts -gt 0 } }
+        Write-ResultsBatch -Batch $batchToCsv
+        $pct = [int](($processed / $total) * 100)
+        Write-LogMessage ("Progress: {0}/{1} ({2}%) - {3} responsive in this batch" -f $processed, $total, $pct, $batchAlive)
+        Write-Progress -Activity 'Azure Migrate Discovery Scan' -Status "$processed / $total" -PercentComplete $pct
     }
+    Write-Progress -Activity 'Azure Migrate Discovery Scan' -Completed
 } else {
-    Write-Host "Scanning sequentially (PowerShell 5.1)..." -ForegroundColor Cyan
+    Write-LogMessage "Scanning sequentially (PowerShell 5.1)..."
     $i = 0
+    $batchBuffer = New-Object System.Collections.Generic.List[object]
     foreach ($t in $targets) {
         $i++
+        Write-LogMessage ("Testing {0} ({1} / {2})" -f $t, $i, $total)
         Write-Progress -Activity 'Azure Migrate Discovery Scan' -Status "Testing $t ($i / $total)" -PercentComplete (($i / $total) * 100)
-        $results += & $scanScript $t $portsToTest $TimeoutSeconds $PingTimeoutMs
+        $r = & $scanScript $t $portsToTest $TimeoutSeconds $PingTimeoutMs
+        $results.Add($r)
+        $batchBuffer.Add($r)
+        if ($batchBuffer.Count -ge $batchSize -or $i -eq $total) {
+            $batchToCsv = if ($IncludeUnreachable) { $batchBuffer } else { $batchBuffer | Where-Object { $_.Ping -eq 'OK' -or $_.OpenPorts -gt 0 } }
+            Write-ResultsBatch -Batch $batchToCsv
+            $pct = [int](($i / $total) * 100)
+            Write-LogMessage ("Progress: {0}/{1} ({2}%)" -f $i, $total, $pct)
+            $batchBuffer.Clear()
+        }
     }
     Write-Progress -Activity 'Azure Migrate Discovery Scan' -Completed
 }
@@ -490,16 +534,36 @@ $filtered = if ($IncludeUnreachable) {
     $results | Where-Object { $_.Ping -eq 'OK' -or $_.OpenPorts -gt 0 }
 }
 
-# Console table + persistent CSV (full unfiltered counts are still in $results below)
-# Render the table via Out-String + Write-Host so it is reliably captured in the
-# Start-Transcript log (Format-Table's host output is not always transcribed).
-$tableTextConsole = if ($filtered) {
-    ($filtered | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()
+# Console table + persistent CSV (CSV was already streamed per batch above).
+# Cap the on-screen table for very large scans so the terminal doesn't choke;
+# the CSV and report still contain every row.
+$consolePreviewMax = 200
+$consoleSet = $filtered
+$truncatedNote = ''
+if (($filtered | Measure-Object).Count -gt $consolePreviewMax) {
+    $consoleSet = $filtered | Select-Object -First $consolePreviewMax
+    $truncatedNote = "... showing first $consolePreviewMax of $(($filtered | Measure-Object).Count) rows. Full results in $OutputCsv and $OutputReport."
+}
+$tableTextConsole = if ($consoleSet) {
+    ($consoleSet | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()
 } else {
     '(no rows to display)'
 }
 Write-Host $tableTextConsole
-$filtered | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+if ($truncatedNote) { Write-Host $truncatedNote -ForegroundColor Yellow }
+
+# If batched writes never happened (e.g. every host filtered out), still produce
+# a CSV with the expected header so downstream tooling sees a valid file.
+if (-not $csvHeaderDone) {
+    if ($results.Count -gt 0) {
+        $results[0] | Select-Object * | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+        Clear-Content -Path $OutputCsv
+        ($results[0] | Select-Object * | ConvertTo-Csv -NoTypeInformation)[0] | Set-Content -Path $OutputCsv -Encoding UTF8
+    } else {
+        Set-Content -Path $OutputCsv -Value '' -Encoding UTF8
+    }
+    $csvHeaderDone = $true
+}
 
 # Summary metrics
 Write-Host ""
